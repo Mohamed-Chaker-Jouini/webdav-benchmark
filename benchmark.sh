@@ -25,7 +25,7 @@ FILE_SIZE_MB="${3:-1000}"     # SINGLE-STREAM test file size in MB (default 1GB)
 PARALLEL_FILE_MB="${4:-200}"  # PER-STREAM file size for parallel rounds (default 200MB - keeps total data bounded)
 DAV_PATH="dav"
 TEST_DIR="/tmp/webdav_bench"
-PARALLEL_LEVELS=(2 4 8 16)   # stream counts to sweep through - kept modest on purpose
+PARALLEL_LEVELS=(2 4 8 16 32 48 64)   # stream counts to sweep through - kept modest on purpose
 SETTLE_SECONDS=5              # pause between rounds to let server flush dirty pages
 
 # ---------- Colors ----------
