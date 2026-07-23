@@ -309,7 +309,14 @@ done
 # ---------- Parallel sweep: DOWNLOAD ----------
 print_header "PARALLEL DOWNLOAD SWEEP (median of ${REPEATS} runs per level)"
 
-run_curl -T "$PAR_FILE" "${BASE_URL}/par_download_source" --max-time "$MAX_TIME_SECONDS" -o /dev/null -s
+SEED_HTTP=$(run_curl -T "$PAR_FILE" "${BASE_URL}/par_download_source" --max-time "$MAX_TIME_SECONDS" -o /dev/null -s -w "%{http_code}")
+if [[ "$SEED_HTTP" != "201" && "$SEED_HTTP" != "204" ]]; then
+    die "Seed upload of par_download_source failed (http=${SEED_HTTP}). Check server disk space / nginx error.log before continuing."
+fi
+SEED_CHECK=$(run_curl -o /dev/null "${BASE_URL}/par_download_source" --max-time "$MAX_TIME_SECONDS" -s -w "%{http_code}")
+if [[ "$SEED_CHECK" != "200" ]]; then
+    die "par_download_source not retrievable after seed upload (http=${SEED_CHECK}). Aborting instead of running 42 doomed rounds."
+fi
 
 for N in "${PARALLEL_LEVELS[@]}"; do
     if ! check_local_mem; then
