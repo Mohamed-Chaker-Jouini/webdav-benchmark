@@ -194,20 +194,20 @@
 
     - name: Set SELinux permissions for tmp upload dir
       sefcontext:
-        target: '{{ webdav_serve_path }}_tmp(/.*)?'
+        target: '{{ webdav_serve_path }}/.uploadtmp(/.*)?'
         setype: httpd_sys_rw_content_t
         state: present
 
-    - name: Ensure tmp upload dir exists next to serve path (same fs, avoids cross-device copy)
+    - name: Ensure tmp upload dir exists INSIDE serve path (same fs - cheap rename, no cross-device copy)
       file:
-        path: "{{ webdav_serve_path }}_tmp"
+        path: "{{ webdav_serve_path }}/.uploadtmp"
         state: directory
         owner: nginx
         group: nginx
         mode: '0775'
 
     - name: Apply SELinux context to serve + tmp paths
-      command: restorecon -R {{ webdav_serve_path }} {{ webdav_serve_path }}_tmp
+      command: restorecon -R {{ webdav_serve_path }}
       changed_when: false
 
     - name: Deploy WebDAV Nginx configuration
@@ -286,7 +286,7 @@
       command: >
         ssh -o StrictHostKeyChecking=no
         {{ hostvars[groups['webdav_backend'][0]]['ansible_user'] }}@{{ hostvars[groups['webdav_backend'][0]]['inventory_hostname'] }}
-        "find /mnt/webdav_ram -mindepth 1 -delete"
+        "find /mnt/webdav_ram -mindepth 1 -not -path '*/.uploadtmp*' -delete"
       changed_when: false
 
     - name: Run benchmark.sh against the proxy (with raised ulimit applied)

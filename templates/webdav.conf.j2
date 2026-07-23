@@ -4,7 +4,7 @@ server {
 
     client_max_body_size 0;
     client_body_buffer_size 16M;
-    client_body_temp_path {{ webdav_serve_path }}_tmp 1 2;
+    client_body_temp_path {{ webdav_serve_path }}/.uploadtmp 1 2;
 
     aio threads=default;
     output_buffers 2 1m;
