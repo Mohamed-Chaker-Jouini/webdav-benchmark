@@ -1,0 +1,100 @@
+---
+- name: Configure WebDAV Environment on RHEL VMs
+  hosts: all
+  become: yes
+  tasks:
+    - name: Install Nginx, Firewalld, and SELinux utilities from RHEL repos
+      dnf:
+        name:
+          - nginx
+          - firewalld
+          - policycoreutils-python-utils
+        state: present
+
+    - name: Ensure Firewalld is running
+      systemd:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: Allow Port 8080 in Firewalld
+      firewalld:
+        port: 8080/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+# -----------------------------------------------------------
+# Setup WebDAV Backend Server
+# -----------------------------------------------------------
+- name: Configure WebDAV Backend
+  hosts: webdav_backend
+  become: yes
+  tasks:
+    - name: Create WebDAV storage directory
+      file:
+        path: /var/www/webdav
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0775'
+
+    - name: Set SELinux permissions for WebDAV directory
+      sefcontext:
+        target: '/var/www/webdav(/.*)?'
+        setype: httpd_sys_rw_content_t
+        state: present
+
+    - name: Apply SELinux context
+      command: restorecon -R -v /var/www/webdav
+
+    - name: Deploy WebDAV Nginx configuration
+      template:
+        src: templates/webdav.conf.j2
+        dest: /etc/nginx/conf.d/webdav.conf
+      notify: Restart Nginx
+
+    - name: Ensure default server configuration is removed
+      file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+      notify: Restart Nginx
+
+  handlers:
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+# -----------------------------------------------------------
+# Setup Nginx Reverse Proxy
+# -----------------------------------------------------------
+- name: Configure Nginx Reverse Proxy
+  hosts: nginx_proxy
+  become: yes
+  tasks:
+    - name: Allow Nginx to connect to network/backend (SELinux boolean)
+      seboolean:
+        name: httpd_can_network_connect
+        state: yes
+        persistent: yes
+
+    - name: Deploy Proxy Nginx configuration
+      template:
+        src: templates/proxy.conf.j2
+        dest: /etc/nginx/conf.d/proxy.conf
+      notify: Restart Nginx
+
+    - name: Ensure default server configuration is removed
+      file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+      notify: Restart Nginx
+
+  handlers:
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes

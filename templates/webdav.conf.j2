@@ -1,0 +1,22 @@
+server {
+    listen 8080 default_server;
+    server_name _;
+
+    # Allow unlimited upload payload sizes
+    client_max_body_size 0;
+
+    # Hard cap in-memory buffer per connection to prevent RAM exhaustion
+    client_body_buffer_size 16M;
+
+    location /dav {
+        alias /var/www/webdav;
+        
+        # Native WebDAV methods included in standard RHEL nginx package
+        dav_methods PUT DELETE MKCOL COPY MOVE;
+        create_full_put_path on;
+        dav_access user:rw group:rw all:rw;
+
+        # Directory listing
+        autoindex on;
+    }
+}
