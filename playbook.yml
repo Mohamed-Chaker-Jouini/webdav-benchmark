@@ -282,12 +282,15 @@
         path: "{{ playbook_dir }}/benchmark.sh"
         mode: '0755'
 
-    - name: Run benchmark.sh against the proxy
-      command: >
+    - name: Run benchmark.sh against the proxy (with raised ulimit applied)
+      shell: >
+        ulimit -n 1048576 &&
         {{ playbook_dir }}/benchmark.sh {{ proxy_ip }} 8080
         {{ file_size_mb }} {{ parallel_file_mb }} {{ repeats }}
       environment:
         NUMA_NODE: "{{ numa_node_client }}"
+        MAX_TIME_SECONDS: "{{ max_time_seconds | default(15) }}"
+        PARALLEL_LEVELS_OVERRIDE: "{{ parallel_levels_override | default('2 4 8 16 32 48 64') }}"
       register: bench_out
       changed_when: false
 

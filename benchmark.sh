@@ -34,8 +34,8 @@ PARALLEL_FILE_MB="${4:-200}"
 REPEATS="${5:-3}"
 DAV_PATH="dav"
 TEST_DIR="/tmp/webdav_bench"
-PARALLEL_LEVELS=(2 4 8 16 32 48 64)
-MAX_TIME_SECONDS=60            # per-request curl timeout
+PARALLEL_LEVELS=(${PARALLEL_LEVELS_OVERRIDE:-2 4 8 16 32 48 64})
+MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-15}"     # per-request curl timeout (was 60 - way too slow to fail)
 TIME_WAIT_POLL_MAX=30          # max seconds to wait for TIME_WAIT to drain
 TIME_WAIT_THRESHOLD=200        # if more sockets than this remain, warn but continue
 NUMA_NODE="${NUMA_NODE:-}"     # optional: set e.g. NUMA_NODE=0 to pin curl via numactl
