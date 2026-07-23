@@ -2,13 +2,17 @@
 - name: Configure WebDAV Environment on RHEL VMs
   hosts: all
   become: yes
+  vars:
+    numa_subnet: "192.168.95.0/24"
   tasks:
-    - name: Install Nginx, Firewalld, and SELinux utilities from RHEL repos
+    - name: Install Nginx, Firewalld, SELinux, numactl, sysstat
       dnf:
         name:
           - nginx
           - firewalld
           - policycoreutils-python-utils
+          - numactl
+          - sysstat
         state: present
 
     - name: Ensure Firewalld is running
@@ -24,29 +28,204 @@
         state: enabled
         immediate: yes
 
+    # -----------------------------------------------------------
+    # Detect which NIC sits on the NUMA-enabled 192.168.95.0/24 net
+    # -----------------------------------------------------------
+    - name: Detect NUMA-net interface from facts
+      set_fact:
+        numa_iface: "{{ item.key }}"
+      loop: "{{ ansible_facts.items() | list }}"
+      when:
+        - item.value is mapping
+        - item.value.ipv4 is defined
+        - item.value.ipv4.address is defined
+        - item.value.ipv4.address | ansible.utils.network_in_usable(numa_subnet) | default(false)
+      loop_control:
+        label: "{{ item.key }}"
+      ignore_errors: yes
+
+    - name: Fallback NUMA-net interface detection (no netaddr collection needed)
+      set_fact:
+        numa_iface: "{{ ansible_facts[item].device }}"
+      loop: "{{ ansible_facts.interfaces }}"
+      when:
+        - numa_iface is not defined
+        - ansible_facts[item].ipv4 is defined
+        - ansible_facts[item].ipv4.address.split('.')[0:3] | join('.') == '192.168.95'
+
+    - name: Show detected NUMA interface
+      debug:
+        msg: "NUMA-net interface on {{ inventory_hostname }} is {{ numa_iface }}"
+
+    - name: Get NUMA node of the detected interface
+      command: cat /sys/class/net/{{ numa_iface }}/device/numa_node
+      register: numa_node_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Set numa_node fact (treat -1/missing as node 0)
+      set_fact:
+        numa_node: "{{ (numa_node_raw.stdout | default('-1') | trim | int >= 0) | ternary(numa_node_raw.stdout | trim, '0') }}"
+
+    - name: Pin IRQs of the NUMA-net NIC to CPUs on its own NUMA node
+      shell: |
+        set -e
+        IFACE={{ numa_iface }}
+        NODE={{ numa_node }}
+        CPULIST=$(lscpu -p=CPU,NODE | grep -v '^#' | awk -F, -v n="$NODE" '$2==n {print $1}' | paste -sd, -)
+        for IRQ in $(grep "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
+          MASK=$(python3 -c "
+cpus=[int(x) for x in '$CPULIST'.split(',')]
+mask=0
+for c in cpus: mask |= (1<<c)
+print(format(mask,'x'))
+")
+          echo $MASK > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
+        done
+      changed_when: true
+      when: numa_iface is defined
+
+    # -----------------------------------------------------------
+    # sysctl + ulimit tuning (network + fd limits for high-concurrency)
+    # -----------------------------------------------------------
+    - name: Deploy sysctl tuning
+      template:
+        src: templates/99-webdav-bench.conf.j2
+        dest: /etc/sysctl.d/99-webdav-bench.conf
+      notify: Reload sysctl
+
+    - name: Raise system-wide open file limits (limits.conf)
+      blockinfile:
+        path: /etc/security/limits.conf
+        marker: "# {mark} ANSIBLE MANAGED - webdav bench"
+        block: |
+          root soft nofile 1048576
+          root hard nofile 1048576
+          nginx soft nofile 1048576
+          nginx hard nofile 1048576
+          * soft nofile 1048576
+          * hard nofile 1048576
+
+    - name: Create systemd override dir for nginx
+      file:
+        path: /etc/systemd/system/nginx.service.d
+        state: directory
+        mode: '0755'
+      when: "'webdav_backend' in group_names or 'nginx_proxy' in group_names"
+
+    - name: Deploy nginx systemd limit override
+      template:
+        src: templates/nginx_limits_override.conf.j2
+        dest: /etc/systemd/system/nginx.service.d/limits.conf
+      notify: Reload systemd
+      when: "'webdav_backend' in group_names or 'nginx_proxy' in group_names"
+
+    # -----------------------------------------------------------
+    # nginx.conf: worker/event tuning (main context - can't live in conf.d)
+    # -----------------------------------------------------------
+    - name: Set worker_processes auto
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^worker_processes'
+        line: 'worker_processes auto;'
+
+    - name: Set worker_rlimit_nofile
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        insertafter: '^worker_processes'
+        regexp: '^worker_rlimit_nofile'
+        line: 'worker_rlimit_nofile 1048576;'
+
+    - name: Bump worker_connections
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^\s*worker_connections'
+        line: '    worker_connections  65535;'
+
+    - name: Enable multi_accept
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        insertafter: 'worker_connections'
+        regexp: '^\s*multi_accept'
+        line: '    multi_accept on;'
+
+  handlers:
+    - name: Reload sysctl
+      command: sysctl --system
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
 # -----------------------------------------------------------
 # Setup WebDAV Backend Server
 # -----------------------------------------------------------
 - name: Configure WebDAV Backend
   hosts: webdav_backend
   become: yes
+  vars:
+    webdav_disk: /dev/sdb
+    webdav_mount: /data/webdav
+    webdav_tmp: /data/webdav_tmp
   tasks:
-    - name: Create WebDAV storage directory
+    - name: Get UUID of the webdav disk
+      command: blkid -s UUID -o value {{ webdav_disk }}
+      register: webdav_uuid
+      changed_when: false
+
+    - name: Ensure mount point exists
       file:
-        path: /var/www/webdav
+        path: "{{ webdav_mount }}"
         state: directory
         owner: nginx
         group: nginx
         mode: '0775'
 
+    - name: Ensure temp upload dir exists (same filesystem, avoids cross-device copy)
+      file:
+        path: "{{ webdav_tmp }}"
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0775'
+
+    - name: Persist xfs mount in fstab (by UUID) and mount now
+      mount:
+        path: "{{ webdav_mount }}"
+        src: "UUID={{ webdav_uuid.stdout }}"
+        fstype: xfs
+        # noatime: skip access-time writes; nobarrier: safe perf win on most
+        # virtualized SCSI/virtio backends (skip nobarrier if this disk is on
+        # bare metal without a battery-backed controller)
+        opts: defaults,noatime,nodiratime,largeio,inode64
+        state: mounted
+
     - name: Set SELinux permissions for WebDAV directory
       sefcontext:
-        target: '/var/www/webdav(/.*)?'
+        target: '{{ webdav_mount }}(/.*)?'
+        setype: httpd_sys_rw_content_t
+        state: present
+
+    - name: Set SELinux permissions for temp dir
+      sefcontext:
+        target: '{{ webdav_tmp }}(/.*)?'
         setype: httpd_sys_rw_content_t
         state: present
 
     - name: Apply SELinux context
-      command: restorecon -R -v /var/www/webdav
+      command: restorecon -R -v {{ webdav_mount }} {{ webdav_tmp }}
+
+    - name: Set SCSI disk scheduler to mq-deadline (better for throughput than default)
+      shell: |
+        DEV=$(basename {{ webdav_disk }})
+        echo mq-deadline > /sys/block/$DEV/queue/scheduler 2>/dev/null || true
+      changed_when: true
+
+    - name: Make disk scheduler choice persistent via udev rule
+      copy:
+        dest: /etc/udev/rules.d/60-webdav-disk-scheduler.rules
+        content: |
+          ACTION=="add|change", KERNEL=="sdb", ATTR{queue/scheduler}="mq-deadline"
 
     - name: Deploy WebDAV Nginx configuration
       template:
@@ -64,6 +243,7 @@
     - name: Restart Nginx
       systemd:
         name: nginx
+        daemon_reload: yes
         state: restarted
         enabled: yes
 
@@ -96,5 +276,38 @@
     - name: Restart Nginx
       systemd:
         name: nginx
+        daemon_reload: yes
         state: restarted
         enabled: yes
+
+# -----------------------------------------------------------
+# Run the benchmark from the Ansible control node (Ubuntu client)
+# -----------------------------------------------------------
+- name: Run WebDAV benchmark from client
+  hosts: localhost
+  connection: local
+  become: no
+  vars:
+    proxy_ip: "{{ hostvars[groups['nginx_proxy'][0]]['inventory_hostname'] }}"
+    numa_node_client: "{{ numa_node_client | default('0') }}"
+    file_size_mb: "{{ file_size_mb | default(1000) }}"
+    parallel_file_mb: "{{ parallel_file_mb | default(200) }}"
+    repeats: "{{ repeats | default(3) }}"
+  tasks:
+    - name: Ensure benchmark.sh is executable
+      file:
+        path: "{{ playbook_dir }}/benchmark.sh"
+        mode: '0755'
+
+    - name: Run benchmark.sh against the proxy
+      command: >
+        {{ playbook_dir }}/benchmark.sh {{ proxy_ip }} 8080
+        {{ file_size_mb }} {{ parallel_file_mb }} {{ repeats }}
+      environment:
+        NUMA_NODE: "{{ numa_node_client }}"
+      register: bench_out
+      changed_when: false
+
+    - name: Show benchmark output
+      debug:
+        var: bench_out.stdout_lines
