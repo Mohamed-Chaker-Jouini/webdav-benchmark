@@ -145,20 +145,31 @@ for N in "${PARALLEL_LEVELS[@]}"; do
     echo -ne "${YELLOW}Testing ${N} parallel upload streams (per-stream file: ${PARALLEL_FILE_MB}MB)...${RESET}\r"
 
     START=$(date +%s.%N)
+    FAIL_COUNT=0
     for ((i=1; i<=N; i++)); do
-        curl -T "$PAR_FILE" "${BASE_URL}/par_up_${N}_${i}" -o /dev/null -s &
+        (curl -T "$PAR_FILE" "${BASE_URL}/par_up_${N}_${i}" -o /dev/null -s -f || echo "FAIL" >> "${TEST_DIR}/.fail_$$") &
     done
     wait
     END=$(date +%s.%N)
+    if [[ -f "${TEST_DIR}/.fail_$$" ]]; then
+        FAIL_COUNT=$(wc -l < "${TEST_DIR}/.fail_$$")
+        rm -f "${TEST_DIR}/.fail_$$"
+    fi
 
     ELAPSED=$(echo "$END - $START" | bc -l)
-    TOTAL_BYTES=$((PAR_SIZE * N))
+    SUCCESS_COUNT=$((N - FAIL_COUNT))
+    TOTAL_BYTES=$((PAR_SIZE * SUCCESS_COUNT))
     GBIT=$(bytes_to_gbit "$TOTAL_BYTES" "$ELAPSED")
     MBPS=$(echo "scale=1; $TOTAL_BYTES / $ELAPSED / 1000000" | bc -l)
 
     UPLOAD_RESULTS[$N]=$GBIT
-    printf "%-30s %10s MB/s   =>   ${GREEN}%s Gbit/s${RESET}   (%.2fs)   [total data: %s MB]\n" \
-        "Upload  (${N} streams):" "$MBPS" "$GBIT" "$ELAPSED" "$(bytes_to_mb $TOTAL_BYTES)"
+    if [[ "$FAIL_COUNT" -gt 0 ]]; then
+        printf "%-30s %10s MB/s   =>   ${RED}%s Gbit/s${RESET}   (%.2fs)   [${RED}%d/%d FAILED${RESET}, total: %s MB]\n" \
+            "Upload  (${N} streams):" "$MBPS" "$GBIT" "$ELAPSED" "$FAIL_COUNT" "$N" "$(bytes_to_mb $TOTAL_BYTES)"
+    else
+        printf "%-30s %10s MB/s   =>   ${GREEN}%s Gbit/s${RESET}   (%.2fs)   [total data: %s MB]\n" \
+            "Upload  (${N} streams):" "$MBPS" "$GBIT" "$ELAPSED" "$(bytes_to_mb $TOTAL_BYTES)"
+    fi
 
     # cleanup remote files for this round
     for ((i=1; i<=N; i++)); do
@@ -183,20 +194,31 @@ for N in "${PARALLEL_LEVELS[@]}"; do
     echo -ne "${YELLOW}Testing ${N} parallel download streams (per-stream file: ${PARALLEL_FILE_MB}MB)...${RESET}\r"
 
     START=$(date +%s.%N)
+    FAIL_COUNT=0
     for ((i=1; i<=N; i++)); do
-        curl -o /dev/null "${BASE_URL}/par_download_source" -s &
+        (curl -o /dev/null "${BASE_URL}/par_download_source" -s -f || echo "FAIL" >> "${TEST_DIR}/.fail_$$") &
     done
     wait
     END=$(date +%s.%N)
+    if [[ -f "${TEST_DIR}/.fail_$$" ]]; then
+        FAIL_COUNT=$(wc -l < "${TEST_DIR}/.fail_$$")
+        rm -f "${TEST_DIR}/.fail_$$"
+    fi
 
     ELAPSED=$(echo "$END - $START" | bc -l)
-    TOTAL_BYTES=$((PAR_SIZE * N))
+    SUCCESS_COUNT=$((N - FAIL_COUNT))
+    TOTAL_BYTES=$((PAR_SIZE * SUCCESS_COUNT))
     GBIT=$(bytes_to_gbit "$TOTAL_BYTES" "$ELAPSED")
     MBPS=$(echo "scale=1; $TOTAL_BYTES / $ELAPSED / 1000000" | bc -l)
 
     DOWNLOAD_RESULTS[$N]=$GBIT
-    printf "%-30s %10s MB/s   =>   ${GREEN}%s Gbit/s${RESET}   (%.2fs)   [total data: %s MB]\n" \
-        "Download(${N} streams):" "$MBPS" "$GBIT" "$ELAPSED" "$(bytes_to_mb $TOTAL_BYTES)"
+    if [[ "$FAIL_COUNT" -gt 0 ]]; then
+        printf "%-30s %10s MB/s   =>   ${RED}%s Gbit/s${RESET}   (%.2fs)   [${RED}%d/%d FAILED${RESET}, total: %s MB]\n" \
+            "Download(${N} streams):" "$MBPS" "$GBIT" "$ELAPSED" "$FAIL_COUNT" "$N" "$(bytes_to_mb $TOTAL_BYTES)"
+    else
+        printf "%-30s %10s MB/s   =>   ${GREEN}%s Gbit/s${RESET}   (%.2fs)   [total data: %s MB]\n" \
+            "Download(${N} streams):" "$MBPS" "$GBIT" "$ELAPSED" "$(bytes_to_mb $TOTAL_BYTES)"
+    fi
 
     echo -e "${CYAN}Settling (sync + ${SETTLE_SECONDS}s pause) before next round...${RESET}"
     settle
