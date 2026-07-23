@@ -4,21 +4,29 @@
 # Run from the Ubuntu client against a RHEL WebDAV server (nginx dav_module)
 #
 # Usage:
-#   ./webdav_benchmark.sh <server-ip> [port] [file_size_MB]
+#   ./webdav_benchmark.sh <server-ip> [port] [single_stream_file_MB] [parallel_stream_file_MB]
 #
 # Example:
-#   ./webdav_benchmark.sh 10.202.148.159 8080 4000
+#   ./webdav_benchmark.sh 10.202.148.159 8080 1000 200
 #
+# NOTE ON MEMORY SAFETY:
+#   Parallel rounds use a SEPARATE, SMALLER file (parallel_stream_file_MB, default 200MB)
+#   so that N parallel streams don't multiply a huge file N times and blow out RAM/dirty
+#   page cache on the server. A `sync` + pause happens between rounds to let writes flush
+#   to disk before the next round starts. If you still see memory pressure on the SERVER
+#   side, lower PARALLEL_FILE_MB further and/or reduce PARALLEL_LEVELS below.
 
 set -uo pipefail
 
 # ---------- Config ----------
 SERVER_IP="${1:-}"
 PORT="${2:-8080}"
-FILE_SIZE_MB="${3:-4000}"     # test file size in MB (default 4GB, safe for 16GB RAM)
+FILE_SIZE_MB="${3:-1000}"     # SINGLE-STREAM test file size in MB (default 1GB)
+PARALLEL_FILE_MB="${4:-200}"  # PER-STREAM file size for parallel rounds (default 200MB - keeps total data bounded)
 DAV_PATH="dav"
 TEST_DIR="/tmp/webdav_bench"
-PARALLEL_LEVELS=(1 2 4 8 16 32)   # stream counts to sweep through
+PARALLEL_LEVELS=(2 4 8 16)   # stream counts to sweep through - kept modest on purpose
+SETTLE_SECONDS=5              # pause between rounds to let server flush dirty pages
 
 # ---------- Colors ----------
 BOLD="\033[1m"
@@ -43,6 +51,23 @@ command -v dd >/dev/null || die "dd not found"
 
 mkdir -p "$TEST_DIR"
 TEST_FILE="${TEST_DIR}/testfile_${FILE_SIZE_MB}MB"
+PAR_FILE="${TEST_DIR}/parfile_${PARALLEL_FILE_MB}MB"
+
+settle() {
+    # Let dirty pages flush both locally and give the server breathing room
+    sync
+    sleep "$SETTLE_SECONDS"
+}
+
+check_local_mem() {
+    local avail_pct
+    avail_pct=$(free | awk '/Mem:/ {printf "%.0f", $7/$2*100}')
+    if (( avail_pct < 15 )); then
+        echo -e "${RED}WARNING: local available RAM below 15% (${avail_pct}%). Skipping higher concurrency to avoid crash.${RESET}"
+        return 1
+    fi
+    return 0
+}
 
 print_header() {
     echo -e "\n${BOLD}${CYAN}============================================================${RESET}"
@@ -73,7 +98,15 @@ else
     dd if=/dev/zero of="$TEST_FILE" bs=1M count="$FILE_SIZE_MB" oflag=direct status=progress 2>&1 | tail -n 1
 fi
 ACTUAL_SIZE=$(stat -c%s "$TEST_FILE")
-echo -e "${GREEN}Test file ready: $(bytes_to_mb $ACTUAL_SIZE) MB${RESET}"
+echo -e "${GREEN}Single-stream test file ready: $(bytes_to_mb $ACTUAL_SIZE) MB${RESET}"
+
+if [[ -f "$PAR_FILE" ]]; then
+    echo -e "${YELLOW}Reusing existing parallel test file: ${PAR_FILE}${RESET}"
+else
+    dd if=/dev/zero of="$PAR_FILE" bs=1M count="$PARALLEL_FILE_MB" oflag=direct status=progress 2>&1 | tail -n 1
+fi
+PAR_SIZE=$(stat -c%s "$PAR_FILE")
+echo -e "${GREEN}Parallel-round test file ready: $(bytes_to_mb $PAR_SIZE) MB (used per stream)${RESET}"
 
 # ---------- Connectivity check ----------
 print_header "CHECKING SERVER CONNECTIVITY"
@@ -106,57 +139,70 @@ DOWNLOAD_RESULTS[1]=$DOWN_GBIT
 print_header "PARALLEL UPLOAD SWEEP (finding max throughput)"
 
 for N in "${PARALLEL_LEVELS[@]}"; do
-    [[ "$N" -eq 1 ]] && continue   # already have single-stream result
-    echo -ne "${YELLOW}Testing ${N} parallel upload streams...${RESET}\r"
+    if ! check_local_mem; then
+        break
+    fi
+    echo -ne "${YELLOW}Testing ${N} parallel upload streams (per-stream file: ${PARALLEL_FILE_MB}MB)...${RESET}\r"
 
     START=$(date +%s.%N)
     for ((i=1; i<=N; i++)); do
-        curl -T "$TEST_FILE" "${BASE_URL}/par_up_${N}_${i}" -o /dev/null -s &
+        curl -T "$PAR_FILE" "${BASE_URL}/par_up_${N}_${i}" -o /dev/null -s &
     done
     wait
     END=$(date +%s.%N)
 
     ELAPSED=$(echo "$END - $START" | bc -l)
-    TOTAL_BYTES=$((ACTUAL_SIZE * N))
+    TOTAL_BYTES=$((PAR_SIZE * N))
     GBIT=$(bytes_to_gbit "$TOTAL_BYTES" "$ELAPSED")
     MBPS=$(echo "scale=1; $TOTAL_BYTES / $ELAPSED / 1000000" | bc -l)
 
     UPLOAD_RESULTS[$N]=$GBIT
-    printf "%-30s %10s MB/s   =>   ${GREEN}%s Gbit/s${RESET}   (%.2fs)\n" \
-        "Upload  (${N} streams):" "$MBPS" "$GBIT" "$ELAPSED"
+    printf "%-30s %10s MB/s   =>   ${GREEN}%s Gbit/s${RESET}   (%.2fs)   [total data: %s MB]\n" \
+        "Upload  (${N} streams):" "$MBPS" "$GBIT" "$ELAPSED" "$(bytes_to_mb $TOTAL_BYTES)"
 
     # cleanup remote files for this round
     for ((i=1; i<=N; i++)); do
         curl -X DELETE "${BASE_URL}/par_up_${N}_${i}" -s -o /dev/null &
     done
     wait
+
+    echo -e "${CYAN}Settling (sync + ${SETTLE_SECONDS}s pause) before next round...${RESET}"
+    settle
 done
 
 # ---------- Parallel sweep: DOWNLOAD ----------
 print_header "PARALLEL DOWNLOAD SWEEP (finding max throughput)"
 
-# make sure remote source file exists (reuse single_up)
-for N in "${PARALLEL_LEVELS[@]}"; do
-    [[ "$N" -eq 1 ]] && continue
+# upload the small parallel-round file once, use it as the shared download source
+curl -T "$PAR_FILE" "${BASE_URL}/par_download_source" -o /dev/null -s
 
-    echo -ne "${YELLOW}Testing ${N} parallel download streams...${RESET}\r"
+for N in "${PARALLEL_LEVELS[@]}"; do
+    if ! check_local_mem; then
+        break
+    fi
+    echo -ne "${YELLOW}Testing ${N} parallel download streams (per-stream file: ${PARALLEL_FILE_MB}MB)...${RESET}\r"
 
     START=$(date +%s.%N)
     for ((i=1; i<=N; i++)); do
-        curl -o /dev/null "${BASE_URL}/single_up" -s &
+        curl -o /dev/null "${BASE_URL}/par_download_source" -s &
     done
     wait
     END=$(date +%s.%N)
 
     ELAPSED=$(echo "$END - $START" | bc -l)
-    TOTAL_BYTES=$((ACTUAL_SIZE * N))
+    TOTAL_BYTES=$((PAR_SIZE * N))
     GBIT=$(bytes_to_gbit "$TOTAL_BYTES" "$ELAPSED")
     MBPS=$(echo "scale=1; $TOTAL_BYTES / $ELAPSED / 1000000" | bc -l)
 
     DOWNLOAD_RESULTS[$N]=$GBIT
-    printf "%-30s %10s MB/s   =>   ${GREEN}%s Gbit/s${RESET}   (%.2fs)\n" \
-        "Download(${N} streams):" "$MBPS" "$GBIT" "$ELAPSED"
+    printf "%-30s %10s MB/s   =>   ${GREEN}%s Gbit/s${RESET}   (%.2fs)   [total data: %s MB]\n" \
+        "Download(${N} streams):" "$MBPS" "$GBIT" "$ELAPSED" "$(bytes_to_mb $TOTAL_BYTES)"
+
+    echo -e "${CYAN}Settling (sync + ${SETTLE_SECONDS}s pause) before next round...${RESET}"
+    settle
 done
+
+curl -X DELETE "${BASE_URL}/par_download_source" -s -o /dev/null
 
 # ---------- Cleanup remote test files ----------
 curl -X DELETE "${BASE_URL}/single_up" -s -o /dev/null
@@ -197,11 +243,11 @@ echo -e "${CYAN}     add more values to PARALLEL_LEVELS in the script and re-run
 echo -e "${CYAN}     If it plateaus or drops, you've found the real ceiling${RESET}"
 echo -e "${CYAN}     (disk, network, or CPU on server, not WebDAV itself).${RESET}"
 
-# ---------- Cleanup local test file ----------
+# ---------- Cleanup local test files ----------
 echo ""
-read -p "Delete local test file (${TEST_FILE})? [y/N] " -n 1 -r
+read -p "Delete local test files (${TEST_FILE}, ${PAR_FILE})? [y/N] " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-    rm -f "$TEST_FILE"
+    rm -f "$TEST_FILE" "$PAR_FILE"
     echo "Deleted."
 fi
