@@ -45,33 +45,11 @@
       debug:
         msg: "NUMA-net interface on {{ inventory_hostname }} is {{ numa_iface | default('NOT FOUND') }}"
 
-    - name: Get NUMA node of the detected interface
-      command: cat /sys/class/net/{{ numa_iface }}/device/numa_node
-      register: numa_node_raw
-      changed_when: false
-      failed_when: false
-      when: numa_iface is defined
-
-    - name: Set numa_node fact (treat -1/missing as node 0)
-      set_fact:
-        numa_node: "{{ (numa_node_raw.stdout | default('-1') | trim | int >= 0) | ternary(numa_node_raw.stdout | trim, '0') }}"
-      when: numa_iface is defined
-
-    - name: Pin IRQs of the NUMA-net NIC to CPUs on its own NUMA node
-      shell: |
-        set -e
-        IFACE={{ numa_iface }}
-        NODE={{ numa_node }}
-        MASK=0
-        for CPU in $(lscpu -p=CPU,NODE | grep -v '^#' | awk -F, -v n="$NODE" '$2==n {print $1}'); do
-          MASK=$((MASK | (1 << CPU)))
-        done
-        HEXMASK=$(printf '%x' "$MASK")
-        for IRQ in $(grep "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
-          echo "$HEXMASK" > /proc/irq/$IRQ/smp_affinity 2>/dev/null || true
-        done
-      changed_when: true
-      when: numa_iface is defined
+    # NOTE: virtio NICs (ens19 here) expose no /sys numa_node and their
+    # queue interrupts (virtioN-input.X/output.X) are already spread
+    # across per-vCPU IRQs and NUMA-local by default via irqbalance -
+    # confirmed via /proc/interrupts + lscpu -p=CPU,NODE. No manual
+    # pinning needed/possible here, so that step has been removed.
 
     # -----------------------------------------------------------
     # sysctl + ulimit tuning (network + fd limits for high-concurrency)
@@ -145,7 +123,7 @@
     webdav_disk_mount: /data/webdav
     use_tmpfs: true
     webdav_tmpfs_mount: /mnt/webdav_ram
-    webdav_tmpfs_size: 6g
+    webdav_tmpfs_size: 8g
     webdav_serve_path: "{{ webdav_tmpfs_mount if use_tmpfs else webdav_disk_mount }}"
   tasks:
     # --- Real disk, kept mounted/persisted for later non-benchmark use ---
@@ -290,7 +268,7 @@
     proxy_ip: "{{ hostvars[groups['nginx_proxy'][0]]['inventory_hostname'] }}"
     numa_node_client: "{{ numa_node_client | default('0') }}"
     file_size_mb: "{{ file_size_mb | default(1000) }}"
-    parallel_file_mb: "{{ parallel_file_mb | default(100) }}"
+    parallel_file_mb: "{{ parallel_file_mb | default(200) }}"
     repeats: "{{ repeats | default(3) }}"
   tasks:
     - name: Ensure benchmark.sh is executable
