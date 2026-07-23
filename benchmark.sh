@@ -36,8 +36,8 @@ DAV_PATH="dav"
 TEST_DIR="/tmp/webdav_bench"
 PARALLEL_LEVELS=(${PARALLEL_LEVELS_OVERRIDE:-2 4 8 16 32 48 64})
 MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-15}"     # per-request curl timeout (was 60 - way too slow to fail)
-TIME_WAIT_POLL_MAX=30          # max seconds to wait for TIME_WAIT to drain
-TIME_WAIT_THRESHOLD=200        # if more sockets than this remain, warn but continue
+TIME_WAIT_POLL_MAX="${TIME_WAIT_POLL_MAX:-5}"    # max seconds to wait for TIME_WAIT to drain (was 30)
+TIME_WAIT_THRESHOLD="${TIME_WAIT_THRESHOLD:-500}" # raised since tcp_tw_reuse is now set
 NUMA_NODE="${NUMA_NODE:-}"     # optional: set e.g. NUMA_NODE=0 to pin curl via numactl
 STATIC_URL="${STATIC_URL:-}"   # optional: e.g. http://ip:port/staticfile for control test
 
