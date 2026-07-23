@@ -282,6 +282,13 @@
         path: "{{ playbook_dir }}/benchmark.sh"
         mode: '0755'
 
+    - name: Clear stale files from a previous run's tmpfs (server-side)
+      command: >
+        ssh -o StrictHostKeyChecking=no
+        {{ hostvars[groups['webdav_backend'][0]]['ansible_user'] }}@{{ hostvars[groups['webdav_backend'][0]]['inventory_hostname'] }}
+        "find /mnt/webdav_ram -mindepth 1 -delete"
+      changed_when: false
+
     - name: Run benchmark.sh against the proxy (with raised ulimit applied)
       shell: >
         ulimit -n 1048576 &&
