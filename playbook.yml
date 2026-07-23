@@ -192,6 +192,12 @@
         state: present
       when: use_tmpfs
 
+    - name: Set SELinux permissions for tmp upload dir
+      sefcontext:
+        target: '{{ webdav_serve_path }}_tmp(/.*)?'
+        setype: httpd_sys_rw_content_t
+        state: present
+
     - name: Ensure tmp upload dir exists next to serve path (same fs, avoids cross-device copy)
       file:
         path: "{{ webdav_serve_path }}_tmp"
