@@ -123,7 +123,7 @@
     webdav_disk_mount: /data/webdav
     use_tmpfs: true
     webdav_tmpfs_mount: /mnt/webdav_ram
-    webdav_tmpfs_size: 8g
+    webdav_tmpfs_size: 12g
     webdav_serve_path: "{{ webdav_tmpfs_mount if use_tmpfs else webdav_disk_mount }}"
   tasks:
     # --- Real disk, kept mounted/persisted for later non-benchmark use ---
