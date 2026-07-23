@@ -3,29 +3,18 @@ server {
     server_name _;
 
     client_max_body_size 0;
-
-    # Keep per-connection RAM buffer small; spill straight to disk instead of RAM
     client_body_buffer_size 16M;
-    client_body_temp_path /data/webdav_tmp 1 2;
+    client_body_temp_path {{ webdav_serve_path }}_tmp 1 2;
 
-    # Bypass the page cache for large file I/O (this is what actually prevents
-    # OOM under load - without it, every up/download fills page cache RAM
-    # until the kernel starts reclaiming aggressively / OOM-killing nginx)
-    aio threads;
-    directio 4m;
-    directio_alignment 4k;
+    aio threads=default;
     output_buffers 2 1m;
-
-    sendfile off;      # incompatible with directio, not needed for dav PUT/GET anyway
-    tcp_nopush on;
-    tcp_nodelay on;
 
     keepalive_timeout 65s;
     keepalive_requests 100000;
     reset_timedout_connection on;
 
     location /dav {
-        alias /data/webdav;
+        alias {{ webdav_serve_path }};
 
         dav_methods PUT DELETE MKCOL COPY MOVE;
         create_full_put_path on;

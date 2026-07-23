@@ -3,7 +3,7 @@
   hosts: all
   become: yes
   vars:
-    numa_subnet: "192.168.95.0/24"
+    numa_subnet_prefix: "192.168.95"
   tasks:
     - name: Install Nginx, Firewalld, SELinux, numactl, sysstat
       dnf:
@@ -33,39 +33,29 @@
     # -----------------------------------------------------------
     - name: Detect NUMA-net interface from facts
       set_fact:
-        numa_iface: "{{ item.key }}"
-      loop: "{{ ansible_facts.items() | list }}"
-      when:
-        - item.value is mapping
-        - item.value.ipv4 is defined
-        - item.value.ipv4.address is defined
-        - item.value.ipv4.address | ansible.utils.network_in_usable(numa_subnet) | default(false)
-      loop_control:
-        label: "{{ item.key }}"
-      ignore_errors: yes
-
-    - name: Fallback NUMA-net interface detection (no netaddr collection needed)
-      set_fact:
-        numa_iface: "{{ ansible_facts[item].device }}"
+        numa_iface: "{{ item }}"
       loop: "{{ ansible_facts.interfaces }}"
       when:
         - numa_iface is not defined
         - ansible_facts[item].ipv4 is defined
-        - ansible_facts[item].ipv4.address.split('.')[0:3] | join('.') == '192.168.95'
+        - ansible_facts[item].ipv4.address is defined
+        - ansible_facts[item].ipv4.address.split('.')[0:3] | join('.') == numa_subnet_prefix
 
     - name: Show detected NUMA interface
       debug:
-        msg: "NUMA-net interface on {{ inventory_hostname }} is {{ numa_iface }}"
+        msg: "NUMA-net interface on {{ inventory_hostname }} is {{ numa_iface | default('NOT FOUND') }}"
 
     - name: Get NUMA node of the detected interface
       command: cat /sys/class/net/{{ numa_iface }}/device/numa_node
       register: numa_node_raw
       changed_when: false
       failed_when: false
+      when: numa_iface is defined
 
     - name: Set numa_node fact (treat -1/missing as node 0)
       set_fact:
         numa_node: "{{ (numa_node_raw.stdout | default('-1') | trim | int >= 0) | ternary(numa_node_raw.stdout | trim, '0') }}"
+      when: numa_iface is defined
 
     - name: Pin IRQs of the NUMA-net NIC to CPUs on its own NUMA node
       shell: |
@@ -119,33 +109,15 @@
       when: "'webdav_backend' in group_names or 'nginx_proxy' in group_names"
 
     # -----------------------------------------------------------
-    # nginx.conf: worker/event tuning (main context - can't live in conf.d)
+    # nginx.conf is fully managed here - single source of truth,
+    # safe to re-run (template is idempotent: no-op if unchanged)
     # -----------------------------------------------------------
-    - name: Set worker_processes auto
-      lineinfile:
-        path: /etc/nginx/nginx.conf
-        regexp: '^worker_processes'
-        line: 'worker_processes auto;'
-
-    - name: Set worker_rlimit_nofile
-      lineinfile:
-        path: /etc/nginx/nginx.conf
-        insertafter: '^worker_processes'
-        regexp: '^worker_rlimit_nofile'
-        line: 'worker_rlimit_nofile 1048576;'
-
-    - name: Bump worker_connections
-      lineinfile:
-        path: /etc/nginx/nginx.conf
-        regexp: '^\s*worker_connections'
-        line: '    worker_connections  65535;'
-
-    - name: Enable multi_accept
-      lineinfile:
-        path: /etc/nginx/nginx.conf
-        insertafter: 'worker_connections'
-        regexp: '^\s*multi_accept'
-        line: '    multi_accept on;'
+    - name: Deploy managed nginx.conf
+      template:
+        src: templates/nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+      notify: Restart Nginx
+      when: "'webdav_backend' in group_names or 'nginx_proxy' in group_names"
 
   handlers:
     - name: Reload sysctl
@@ -155,6 +127,13 @@
       systemd:
         daemon_reload: yes
 
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        daemon_reload: yes
+        state: restarted
+        enabled: yes
+
 # -----------------------------------------------------------
 # Setup WebDAV Backend Server
 # -----------------------------------------------------------
@@ -163,25 +142,21 @@
   become: yes
   vars:
     webdav_disk: /dev/sdb
-    webdav_mount: /data/webdav
-    webdav_tmp: /data/webdav_tmp
+    webdav_disk_mount: /data/webdav
+    use_tmpfs: true
+    webdav_tmpfs_mount: /mnt/webdav_ram
+    webdav_tmpfs_size: 6g
+    webdav_serve_path: "{{ webdav_tmpfs_mount if use_tmpfs else webdav_disk_mount }}"
   tasks:
+    # --- Real disk, kept mounted/persisted for later non-benchmark use ---
     - name: Get UUID of the webdav disk
       command: blkid -s UUID -o value {{ webdav_disk }}
       register: webdav_uuid
       changed_when: false
 
-    - name: Ensure mount point exists
+    - name: Ensure disk mount point exists
       file:
-        path: "{{ webdav_mount }}"
-        state: directory
-        owner: nginx
-        group: nginx
-        mode: '0775'
-
-    - name: Ensure temp upload dir exists (same filesystem, avoids cross-device copy)
-      file:
-        path: "{{ webdav_tmp }}"
+        path: "{{ webdav_disk_mount }}"
         state: directory
         owner: nginx
         group: nginx
@@ -189,41 +164,67 @@
 
     - name: Persist xfs mount in fstab (by UUID) and mount now
       mount:
-        path: "{{ webdav_mount }}"
+        path: "{{ webdav_disk_mount }}"
         src: "UUID={{ webdav_uuid.stdout }}"
         fstype: xfs
-        # noatime: skip access-time writes; nobarrier: safe perf win on most
-        # virtualized SCSI/virtio backends (skip nobarrier if this disk is on
-        # bare metal without a battery-backed controller)
         opts: defaults,noatime,nodiratime,largeio,inode64
         state: mounted
 
-    - name: Set SELinux permissions for WebDAV directory
+    - name: Set SELinux permissions for disk WebDAV directory
       sefcontext:
-        target: '{{ webdav_mount }}(/.*)?'
+        target: '{{ webdav_disk_mount }}(/.*)?'
         setype: httpd_sys_rw_content_t
         state: present
 
-    - name: Set SELinux permissions for temp dir
-      sefcontext:
-        target: '{{ webdav_tmp }}(/.*)?'
-        setype: httpd_sys_rw_content_t
-        state: present
-
-    - name: Apply SELinux context
-      command: restorecon -R -v {{ webdav_mount }} {{ webdav_tmp }}
-
-    - name: Set SCSI disk scheduler to mq-deadline (better for throughput than default)
+    - name: Set SCSI disk scheduler to none (best for virtio-scsi)
       shell: |
         DEV=$(basename {{ webdav_disk }})
-        echo mq-deadline > /sys/block/$DEV/queue/scheduler 2>/dev/null || true
+        echo none > /sys/block/$DEV/queue/scheduler 2>/dev/null || true
       changed_when: true
 
     - name: Make disk scheduler choice persistent via udev rule
       copy:
         dest: /etc/udev/rules.d/60-webdav-disk-scheduler.rules
         content: |
-          ACTION=="add|change", KERNEL=="sdb", ATTR{queue/scheduler}="mq-deadline"
+          ACTION=="add|change", KERNEL=="sdb", ATTR{queue/scheduler}="none"
+
+    # --- tmpfs, used to serve WebDAV so the disk isn't the bottleneck ---
+    - name: Ensure tmpfs mount point exists
+      file:
+        path: "{{ webdav_tmpfs_mount }}"
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0775'
+      when: use_tmpfs
+
+    - name: Persist tmpfs mount in fstab and mount now
+      mount:
+        path: "{{ webdav_tmpfs_mount }}"
+        src: tmpfs
+        fstype: tmpfs
+        opts: "size={{ webdav_tmpfs_size }},uid=nginx,gid=nginx,mode=0775"
+        state: mounted
+      when: use_tmpfs
+
+    - name: Set SELinux permissions for tmpfs WebDAV directory
+      sefcontext:
+        target: '{{ webdav_tmpfs_mount }}(/.*)?'
+        setype: httpd_sys_rw_content_t
+        state: present
+      when: use_tmpfs
+
+    - name: Ensure tmp upload dir exists next to serve path (same fs, avoids cross-device copy)
+      file:
+        path: "{{ webdav_serve_path }}_tmp"
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0775'
+
+    - name: Apply SELinux context to serve + tmp paths
+      command: restorecon -R {{ webdav_serve_path }} {{ webdav_serve_path }}_tmp
+      changed_when: false
 
     - name: Deploy WebDAV Nginx configuration
       template:
@@ -289,7 +290,7 @@
     proxy_ip: "{{ hostvars[groups['nginx_proxy'][0]]['inventory_hostname'] }}"
     numa_node_client: "{{ numa_node_client | default('0') }}"
     file_size_mb: "{{ file_size_mb | default(1000) }}"
-    parallel_file_mb: "{{ parallel_file_mb | default(200) }}"
+    parallel_file_mb: "{{ parallel_file_mb | default(100) }}"
     repeats: "{{ repeats | default(3) }}"
   tasks:
     - name: Ensure benchmark.sh is executable
