@@ -30,14 +30,26 @@ set -uo pipefail
 SERVER_IP="${1:-}"
 PORT="${2:-8080}"
 FILE_SIZE_MB="${3:-1000}"
-PARALLEL_FILE_MB="${4:-200}"
+PARALLEL_FILE_MB_REQUESTED="${4:-200}"
 REPEATS="${5:-3}"
 DAV_PATH="dav"
 TEST_DIR="/tmp/webdav_bench"
-PARALLEL_LEVELS=(${PARALLEL_LEVELS_OVERRIDE:-2 4 8 16 32 48 64})
+PARALLEL_LEVELS=(${PARALLEL_LEVELS_OVERRIDE:-2 4 8 16 32 48 64 96 128})
 MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-15}"     # per-request curl timeout (was 60 - way too slow to fail)
 TIME_WAIT_POLL_MAX="${TIME_WAIT_POLL_MAX:-5}"    # max seconds to wait for TIME_WAIT to drain (was 30)
 TIME_WAIT_THRESHOLD="${TIME_WAIT_THRESHOLD:-500}" # raised since tcp_tw_reuse is now set
+
+# Auto-scale per-stream file size so (max_streams * file_size) never exceeds the
+# tmpfs budget - this is what caused the ENOSPC collapse at 64 streams before.
+TMPFS_BUDGET_MB="${TMPFS_BUDGET_MB:-8192}"     # leave headroom under the 12g tmpfs
+MAX_LEVEL=$(printf '%s\n' "${PARALLEL_LEVELS[@]}" | sort -n | tail -1)
+MAX_SAFE_FILE_MB=$(( TMPFS_BUDGET_MB / MAX_LEVEL ))
+if (( PARALLEL_FILE_MB_REQUESTED > MAX_SAFE_FILE_MB )); then
+    PARALLEL_FILE_MB="$MAX_SAFE_FILE_MB"
+    echo "NOTE: requested ${PARALLEL_FILE_MB_REQUESTED}MB per stream would need $(( MAX_LEVEL * PARALLEL_FILE_MB_REQUESTED ))MB at ${MAX_LEVEL} streams - capping to ${PARALLEL_FILE_MB}MB to fit ${TMPFS_BUDGET_MB}MB tmpfs budget."
+else
+    PARALLEL_FILE_MB="$PARALLEL_FILE_MB_REQUESTED"
+fi
 NUMA_NODE="${NUMA_NODE:-}"     # optional: set e.g. NUMA_NODE=0 to pin curl via numactl
 STATIC_URL="${STATIC_URL:-}"   # optional: e.g. http://ip:port/staticfile for control test
 
