@@ -297,7 +297,7 @@
       environment:
         NUMA_NODE: "{{ numa_node_client }}"
         MAX_TIME_SECONDS: "{{ max_time_seconds | default(15) }}"
-        PARALLEL_LEVELS_OVERRIDE: "{{ parallel_levels_override | default('2 4 8 16 32 48 64') }}"
+        PARALLEL_LEVELS_OVERRIDE: "{{ parallel_levels_override | default('2 4 8 16 32 48 64 96 128') }}"
       register: bench_out
       changed_when: false
 
