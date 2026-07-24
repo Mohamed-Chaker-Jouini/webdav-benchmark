@@ -8,7 +8,10 @@ set -uo pipefail
 PROXY_IP="${1:-192.168.95.1}"
 BACKEND_IP="${2:-192.168.95.2}"
 SSH_USER="${SSH_USER:-root}"
-SSH="ssh -o StrictHostKeyChecking=no ${SSH_USER}"
+ssh_run() {
+    local host="$1"; shift
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${SSH_USER}@${host}" "$@"
+}
 
 echo "=============================================="
 echo "STATIC INFO (before load)"
@@ -22,16 +25,22 @@ echo "--- client: nginx? (should be none, client has no nginx) ---"
 which nginx 2>/dev/null || echo "n/a (expected)"
 
 echo "--- backend ($BACKEND_IP): tmpfs usage ---"
-$SSH "$BACKEND_IP" "df -h /mnt/webdav_ram" 2>&1
+ssh_run "$BACKEND_IP" "df -h /mnt/webdav_ram" 2>&1
 
 echo "--- backend ($BACKEND_IP): nginx worker_processes / thread_pool config ---"
-$SSH "$BACKEND_IP" "grep -E 'worker_processes|thread_pool|worker_connections|worker_rlimit' /etc/nginx/nginx.conf" 2>&1
+ssh_run "$BACKEND_IP" "grep -E 'worker_processes|thread_pool|worker_connections|worker_rlimit' /etc/nginx/nginx.conf" 2>&1
 
 echo "--- backend ($BACKEND_IP): nginx worker count actually running ---"
-$SSH "$BACKEND_IP" "ps -C nginx -o pid,psr,pcpu,cmd --no-headers | wc -l" 2>&1
+ssh_run "$BACKEND_IP" "ps -C nginx -o pid,psr,pcpu,cmd --no-headers | wc -l" 2>&1
 
 echo "--- proxy ($PROXY_IP): nginx worker_processes config ---"
-$SSH "$PROXY_IP" "grep -E 'worker_processes|worker_connections|worker_rlimit' /etc/nginx/nginx.conf" 2>&1
+ssh_run "$PROXY_IP" "grep -E 'worker_processes|worker_connections|worker_rlimit' /etc/nginx/nginx.conf" 2>&1
+
+echo ""
+echo "=============================================="
+echo "CLEARING STALE TMPFS FILES"
+echo "=============================================="
+ssh_run "$BACKEND_IP" "find /mnt/webdav_ram -mindepth 1 -not -path '*/.uploadtmp*' -delete" 2>&1
 
 echo ""
 echo "=============================================="
@@ -62,25 +71,25 @@ for p in $(pgrep -f 'curl|benchmark.sh'); do
 done | sort -t: -k2 -n | tail -5
 
 echo "--- backend ($BACKEND_IP): mpstat all cores (1s sample) ---"
-$SSH "$BACKEND_IP" "mpstat -P ALL 1 1 2>/dev/null || (echo 'mpstat not installed, using /proc/stat snapshot'; cat /proc/loadavg)" 2>&1
+ssh_run "$BACKEND_IP" "mpstat -P ALL 1 1 2>/dev/null || (echo 'mpstat not installed, using /proc/stat snapshot'; cat /proc/loadavg)" 2>&1
 
 echo "--- backend ($BACKEND_IP): ss -s ---"
-$SSH "$BACKEND_IP" "ss -s" 2>&1
+ssh_run "$BACKEND_IP" "ss -s" 2>&1
 
 echo "--- backend ($BACKEND_IP): tmpfs usage mid-run ---"
-$SSH "$BACKEND_IP" "df -h /mnt/webdav_ram" 2>&1
+ssh_run "$BACKEND_IP" "df -h /mnt/webdav_ram" 2>&1
 
 echo "--- backend ($BACKEND_IP): thread pool / queue errors in nginx log ---"
-$SSH "$BACKEND_IP" "grep -iE 'thread pool|queue overflow|worker_connections|accept4|EMFILE|ENFILE|no space' /var/log/nginx/error.log | tail -20" 2>&1
+ssh_run "$BACKEND_IP" "grep -iE 'thread pool|queue overflow|worker_connections|accept4|EMFILE|ENFILE|no space' /var/log/nginx/error.log | tail -20" 2>&1
 
 echo "--- backend ($BACKEND_IP): recent nginx errors (any) ---"
-$SSH "$BACKEND_IP" "tail -20 /var/log/nginx/error.log" 2>&1
+ssh_run "$BACKEND_IP" "tail -20 /var/log/nginx/error.log" 2>&1
 
 echo "--- proxy ($PROXY_IP): ss -s ---"
-$SSH "$PROXY_IP" "ss -s" 2>&1
+ssh_run "$PROXY_IP" "ss -s" 2>&1
 
 echo "--- proxy ($PROXY_IP): recent nginx errors ---"
-$SSH "$PROXY_IP" "tail -20 /var/log/nginx/error.log" 2>&1
+ssh_run "$PROXY_IP" "tail -20 /var/log/nginx/error.log" 2>&1
 
 echo ""
 echo "Waiting for benchmark to finish (up to 60s more)..."
@@ -89,7 +98,7 @@ sleep 1
 
 echo ""
 echo "=============================================="
-echo "BENCHMARK REavSULT (64-stream round)"
+echo "BENCHMARK RESULT (64-stream round)"
 echo "=============================================="
 tail -40 /tmp/debug_bench_run.log
 
