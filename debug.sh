@@ -89,7 +89,7 @@ sleep 1
 
 echo ""
 echo "=============================================="
-echo "BENCHMARK RESULT (64-stream round)"
+echo "BENCHMARK REavSULT (64-stream round)"
 echo "=============================================="
 tail -40 /tmp/debug_bench_run.log
 
